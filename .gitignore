@@ -1,0 +1,6 @@
+build
+.cache
+.vscode
+build/*
+build/ALL_BUILD.vcxproj
+/build

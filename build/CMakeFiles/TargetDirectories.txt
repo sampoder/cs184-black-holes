@@ -1,3 +1,3 @@
-C:/Users/anike/source/repos/cs184-black-holes/build/CMakeFiles/blackhole.dir
-C:/Users/anike/source/repos/cs184-black-holes/build/CMakeFiles/ALL_BUILD.dir
-C:/Users/anike/source/repos/cs184-black-holes/build/CMakeFiles/ZERO_CHECK.dir
+/Users/sam/Documents/GitHub/cs184-black-holes/build/CMakeFiles/blackhole.dir
+/Users/sam/Documents/GitHub/cs184-black-holes/build/CMakeFiles/edit_cache.dir
+/Users/sam/Documents/GitHub/cs184-black-holes/build/CMakeFiles/rebuild_cache.dir
