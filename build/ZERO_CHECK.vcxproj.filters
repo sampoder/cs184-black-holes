@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\anike\source\repos\cs184-black-holes\build\CMakeFiles\cff2e92bb3168cd25567c7fa8374f2ed\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{CC4B726C-F21C-33D4-83A5-70ED01B1A9CC}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

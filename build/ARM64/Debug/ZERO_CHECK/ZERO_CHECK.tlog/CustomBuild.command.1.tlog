@@ -1,0 +1,10 @@
+^C:\USERS\ANIKE\SOURCE\REPOS\CS184-BLACK-HOLES\BUILD\CMAKEFILES\CFF2E92BB3168CD25567C7FA8374F2ED\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SC:/Users/anike/source/repos/cs184-black-holes -BC:/Users/anike/source/repos/cs184-black-holes/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/anike/source/repos/cs184-black-holes/build/cs184-black-holes.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
