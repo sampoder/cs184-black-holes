@@ -6,22 +6,32 @@
 #endif
 #include <GLFW/glfw3.h>
 
-#include <cstdint>
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 // ── Resolution ──────────────────────────────────────────────────────────────
 constexpr int WIDTH  = 200;
 constexpr int HEIGHT = 200;
 
 // ── Pixel buffer ────────────────────────────────────────────────────────────
-uint8_t pixels[HEIGHT][WIDTH][3];
+using PixelBuffer = std::vector<uint8_t>;
 
-inline void setPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+static PixelBuffer displayPixels(WIDTH * HEIGHT * 3, 0);
+static PixelBuffer stagingPixels(WIDTH * HEIGHT * 3, 0);
+
+inline void setPixel(PixelBuffer& buffer, int x, int y, uint8_t r, uint8_t g, uint8_t b) {
     if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT) return;
-    pixels[y][x][0] = r;
-    pixels[y][x][1] = g;
-    pixels[y][x][2] = b;
+    const int index = (y * WIDTH + x) * 3;
+    buffer[index + 0] = r;
+    buffer[index + 1] = g;
+    buffer[index + 2] = b;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -45,6 +55,12 @@ struct Vec3 {
     }
 };
 
+struct CameraState {
+    double dist;
+    double yaw;
+    double pitch;
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Black hole parameters — tweak these!
 // ═══════════════════════════════════════════════════════════════════════════
@@ -63,11 +79,10 @@ constexpr double MAX_DIST  = 80.0;
 // ═══════════════════════════════════════════════════════════════════════════
 //  Camera state — modified by input
 // ═══════════════════════════════════════════════════════════════════════════
-static double camDist    = 30.0;
-static double camYaw     = 0.0;      // orbit angle around Y axis
-static double camPitch   = 1.2;      // tilt (0 = edge-on, π/2 = top-down)
-static bool   needsRedraw = true;
-static bool   isMoving    = false;
+static double camDist      = 30.0;
+static double camYaw       = 0.0;
+static double camPitch     = 1.2;
+static bool   needsRedraw  = true;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Mouse state
@@ -76,9 +91,18 @@ static bool   mouseDown  = false;
 static double lastMouseX = 0.0;
 static double lastMouseY = 0.0;
 
-// Idle timing — full-res render fires after input stops
-constexpr double IDLE_DELAY_S = 0.3;
-static double    lastInputTime = -1.0;  // <0 means no pending idle render
+// ═══════════════════════════════════════════════════════════════════════════
+//  Render threading
+// ═══════════════════════════════════════════════════════════════════════════
+static std::mutex              renderMutex;
+static std::condition_variable renderCv;
+static CameraState             pendingCamera{camDist, camYaw, camPitch};
+static std::atomic<uint64_t>   renderGeneration{0};
+static uint64_t                requestedGeneration = 0;
+static uint64_t                completedGeneration = 0;
+static bool                    renderRequested = false;
+static bool                    renderReady = false;
+static bool                    shuttingDown = false;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Starfield
@@ -98,8 +122,8 @@ void starColour(const Vec3& dir, uint8_t& r, uint8_t& g, uint8_t& b) {
     if ((h & 0xFF) < 8) {
         int brightness = 140 + (int)(h >> 8) % 116;
         int tint = (h >> 16) % 4;
-        if (tint == 0)      { r = (uint8_t)brightness; g = (uint8_t)(brightness*0.85); b = (uint8_t)(brightness*0.7); }
-        else if (tint == 1) { r = (uint8_t)(brightness*0.7); g = (uint8_t)(brightness*0.85); b = (uint8_t)brightness; }
+        if (tint == 0)      { r = (uint8_t)brightness; g = (uint8_t)(brightness * 0.85); b = (uint8_t)(brightness * 0.7); }
+        else if (tint == 1) { r = (uint8_t)(brightness * 0.7); g = (uint8_t)(brightness * 0.85); b = (uint8_t)brightness; }
         else                { r = (uint8_t)brightness; g = (uint8_t)brightness; b = (uint8_t)brightness; }
     } else {
         r = 2; g = 2; b = 5;
@@ -139,38 +163,51 @@ void diskColour(double radius, double angle, uint8_t& r, uint8_t& g, uint8_t& b)
 //  Ray tracer
 // ═══════════════════════════════════════════════════════════════════════════
 void traceRay(Vec3 pos, Vec3 dir, uint8_t& r, uint8_t& g, uint8_t& b) {
-    Vec3 h_vec = pos.cross(dir);
-    double h2 = h_vec.dot(h_vec);
+    Vec3 hVec = pos.cross(dir);
+    double h2 = hVec.dot(hVec);
+
     for (int step = 0; step < MAX_STEPS; ++step) {
-        double dist = pos.length();
+        double dist2 = pos.dot(pos);
+        double dist = sqrt(dist2);
         if (dist < RS) { r = 0; g = 0; b = 0; return; }
         if (dist > MAX_DIST) { starColour(dir.normalised(), r, g, b); return; }
         if (fabs(pos.y) < DISK_HALF_THICKNESS) {
-            double diskR = sqrt(pos.x*pos.x + pos.z*pos.z);
+            double diskR = sqrt(pos.x * pos.x + pos.z * pos.z);
             if (diskR > DISK_INNER && diskR < DISK_OUTER) {
                 double angle = atan2(pos.z, pos.x);
                 diskColour(diskR, angle, r, g, b);
                 return;
             }
         }
-        double dist5 = dist*dist*dist*dist*dist;
-        double accelMag = -1.5 * RS * h2 / dist5;
+
+        double invDist = 1.0 / dist;
+        double invDist5 = invDist * invDist * invDist * invDist * invDist;
+        double accelMag = -1.5 * RS * h2 * invDist5;
         Vec3 accel = pos * accelMag;
         dir = dir + accel * STEP_SIZE;
         pos = pos + dir * STEP_SIZE;
     }
+
     r = 0; g = 0; b = 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  RENDER — now with adjustable resolution
-//  blockSize = 1 → full quality, blockSize = 4 or 8 → fast preview
-// ═══════════════════════════════════════════════════════════════════════════
-void render(int blockSize = 1) {
+static void clampCamera() {
+    const double PI = 3.14159265358979;
+    if (camPitch < 0.1)       camPitch = 0.1;
+    if (camPitch > PI - 0.1)  camPitch = PI - 0.1;
+    if (camDist < RS * 2.5)   camDist  = RS * 2.5;
+    if (camDist > 100.0)      camDist  = 100.0;
+}
+
+void renderRows(const CameraState& camera,
+                PixelBuffer& buffer,
+                int rowStart,
+                int rowEnd,
+                uint64_t generation) {
     Vec3 camPos = {
-        camDist * sin(camPitch) * sin(camYaw),
-        camDist * cos(camPitch),
-        camDist * sin(camPitch) * cos(camYaw)
+        camera.dist * sin(camera.pitch) * sin(camera.yaw),
+        camera.dist * cos(camera.pitch),
+        camera.dist * sin(camera.pitch) * cos(camera.yaw)
     };
 
     Vec3 forward = (Vec3{0,0,0} - camPos).normalised();
@@ -181,20 +218,74 @@ void render(int blockSize = 1) {
 
     double halfFov = tan(FOV * 0.5);
 
-    for (int py = 0; py < HEIGHT; py += blockSize) {
-        for (int px = 0; px < WIDTH; px += blockSize) {
-            double nx = (2.0 * (px + blockSize * 0.5) / WIDTH  - 1.0) * halfFov;
-            double ny = (1.0 - 2.0 * (py + blockSize * 0.5) / HEIGHT) * halfFov;
+    for (int py = rowStart; py < rowEnd; ++py) {
+        if (renderGeneration.load(std::memory_order_relaxed) != generation) return;
 
+        const double ny = (1.0 - 2.0 * (py + 0.5) / HEIGHT) * halfFov;
+        for (int px = 0; px < WIDTH; ++px) {
+            const double nx = (2.0 * (px + 0.5) / WIDTH - 1.0) * halfFov;
             Vec3 rayDir = (forward + right * nx + up * ny).normalised();
 
             uint8_t r, g, b;
             traceRay(camPos, rayDir, r, g, b);
+            setPixel(buffer, px, py, r, g, b);
+        }
+    }
+}
 
-            // Fill the block with this colour
-            for (int by = 0; by < blockSize && py + by < HEIGHT; ++by)
-                for (int bx = 0; bx < blockSize && px + bx < WIDTH; ++bx)
-                    setPixel(px + bx, py + by, r, g, b);
+static void requestRender() {
+    {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        pendingCamera = {camDist, camYaw, camPitch};
+        requestedGeneration = renderGeneration.fetch_add(1, std::memory_order_relaxed) + 1;
+        renderRequested = true;
+    }
+    renderCv.notify_one();
+}
+
+static void renderWorker() {
+    const unsigned threadCount = std::max(1u, std::thread::hardware_concurrency());
+
+    while (true) {
+        CameraState camera{};
+        uint64_t generation = 0;
+
+        {
+            std::unique_lock<std::mutex> lock(renderMutex);
+            renderCv.wait(lock, [] { return renderRequested || shuttingDown; });
+            if (shuttingDown) return;
+
+            camera = pendingCamera;
+            generation = requestedGeneration;
+            renderRequested = false;
+            renderReady = false;
+        }
+
+        PixelBuffer localPixels(WIDTH * HEIGHT * 3, 0);
+        std::vector<std::thread> workers;
+        workers.reserve(threadCount);
+
+        const int rowsPerWorker = (HEIGHT + static_cast<int>(threadCount) - 1) / static_cast<int>(threadCount);
+        for (unsigned i = 0; i < threadCount; ++i) {
+            const int rowStart = static_cast<int>(i) * rowsPerWorker;
+            const int rowEnd = std::min(HEIGHT, rowStart + rowsPerWorker);
+            if (rowStart >= rowEnd) break;
+            workers.emplace_back([&, rowStart, rowEnd] {
+                renderRows(camera, localPixels, rowStart, rowEnd, generation);
+            });
+        }
+
+        for (std::thread& worker : workers) {
+            worker.join();
+        }
+
+        if (renderGeneration.load(std::memory_order_relaxed) != generation) continue;
+
+        {
+            std::lock_guard<std::mutex> lock(renderMutex);
+            stagingPixels.swap(localPixels);
+            completedGeneration = generation;
+            renderReady = true;
         }
     }
 }
@@ -202,10 +293,6 @@ void render(int blockSize = 1) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  GLFW callbacks
 // ═══════════════════════════════════════════════════════════════════════════
-static void scheduleIdleRender() {
-    lastInputTime = glfwGetTime();
-}
-
 static void key_callback(GLFWwindow* win, int key, int /*sc*/, int action, int /*mods*/) {
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
@@ -228,16 +315,8 @@ static void key_callback(GLFWwindow* win, int key, int /*sc*/, int action, int /
     }
 
     if (moved) {
-        const double PI = 3.14159265358979;
-        if (camPitch < 0.1)       camPitch = 0.1;
-        if (camPitch > PI - 0.1)  camPitch = PI - 0.1;
-        if (camDist < RS * 2.5)   camDist  = RS * 2.5;
-        if (camDist > 100.0)      camDist  = 100.0;
-
-        isMoving = true;
-        render(8);
-        needsRedraw = true;
-        scheduleIdleRender();
+        clampCamera();
+        requestRender();
     }
 }
 
@@ -248,12 +327,12 @@ static void mouse_button_callback(GLFWwindow* win, int button, int action, int /
         glfwGetCursorPos(win, &lastMouseX, &lastMouseY);
     } else if (action == GLFW_RELEASE) {
         mouseDown = false;
-        scheduleIdleRender();
     }
 }
 
 static void cursor_position_callback(GLFWwindow* /*win*/, double mx, double my) {
     if (!mouseDown) return;
+
     double dx = mx - lastMouseX;
     double dy = my - lastMouseY;
     lastMouseX = mx;
@@ -262,25 +341,14 @@ static void cursor_position_callback(GLFWwindow* /*win*/, double mx, double my) 
     camYaw   += dx * 0.005;
     camPitch += dy * 0.005;
 
-    const double PI = 3.14159265358979;
-    if (camPitch < 0.1)       camPitch = 0.1;
-    if (camPitch > PI - 0.1)  camPitch = PI - 0.1;
-
-    isMoving = true;
-    render(8);
-    needsRedraw = true;
-    scheduleIdleRender();
+    clampCamera();
+    requestRender();
 }
 
 static void scroll_callback(GLFWwindow* /*win*/, double /*xoff*/, double yoff) {
     camDist -= yoff * 2.0;
-    if (camDist < RS * 2.5) camDist = RS * 2.5;
-    if (camDist > 100.0)    camDist = 100.0;
-
-    isMoving = true;
-    render(8);
-    needsRedraw = true;
-    scheduleIdleRender();
+    clampCamera();
+    requestRender();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -292,11 +360,9 @@ static void drawFrame(GLFWwindow* win) {
     glViewport(0, 0, fbw, fbh);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // glDrawPixels draws from bottom-left; our buffer is top-left.
-    // Flip with a negative raster zoom.
     glPixelZoom((float)fbw / (float)WIDTH, -(float)fbh / (float)HEIGHT);
     glRasterPos2f(-1.0f, 1.0f);
-    glDrawPixels(WIDTH, HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, pixels);
+    glDrawPixels(WIDTH, HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, displayPixels.data());
 
     glfwSwapBuffers(win);
 }
@@ -317,24 +383,25 @@ int main() {
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
 
+    std::thread worker(renderWorker);
+
     glfwSetKeyCallback(win, key_callback);
     glfwSetMouseButtonCallback(win, mouse_button_callback);
     glfwSetCursorPosCallback(win, cursor_position_callback);
     glfwSetScrollCallback(win, scroll_callback);
 
-    // Initial full-res render
-    render(1);
-    needsRedraw = true;
+    requestRender();
 
     while (!glfwWindowShouldClose(win)) {
-        glfwWaitEventsTimeout(0.05);
+        glfwWaitEventsTimeout(0.01);
 
-        // Idle-timer equivalent: if input has settled, do a full-res pass.
-        if (lastInputTime >= 0.0 && glfwGetTime() - lastInputTime > IDLE_DELAY_S) {
-            lastInputTime = -1.0;
-            isMoving = false;
-            render(1);
-            needsRedraw = true;
+        {
+            std::lock_guard<std::mutex> lock(renderMutex);
+            if (renderReady && completedGeneration == renderGeneration.load(std::memory_order_relaxed)) {
+                displayPixels.swap(stagingPixels);
+                renderReady = false;
+                needsRedraw = true;
+            }
         }
 
         if (needsRedraw) {
@@ -342,6 +409,13 @@ int main() {
             drawFrame(win);
         }
     }
+
+    {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        shuttingDown = true;
+    }
+    renderCv.notify_one();
+    worker.join();
 
     glfwDestroyWindow(win);
     glfwTerminate();
