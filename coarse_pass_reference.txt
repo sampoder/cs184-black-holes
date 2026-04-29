@@ -1,0 +1,47 @@
+// Reference: progressive coarse-then-fine rendering.
+//
+// This used to live in renderCoordinator() and was removed when continuous
+// 60 Hz animation rendering made progressive feedback redundant (it would
+// just flash chunky-then-fine pixels every frame).
+//
+// Useful again if you ever:
+//   • disable the continuous-tick loop (back to input-driven renders), and
+//   • want sub-second visual feedback during big camera jumps for slow scenes.
+//
+// To restore: paste the body of REFERENCE_SNIPPET below into renderCoordinator()
+// in place of the single runPass() call. renderTile()/runPass() still take the
+// `stride` argument.
+//
+// File is intentionally guarded out of compilation so clangd won't flag the
+// snippet as undeclared identifiers — it's reference text, not real code.
+
+#if 0
+void REFERENCE_SNIPPET() {
+    PixelBuffer localPixels(WIDTH * HEIGHT * 3, 0);
+
+    // Pass 1: coarse 4×4 block render — almost instant feedback.
+    runPass(camera, localPixels, 4, generation);
+
+    if (renderGeneration.load(std::memory_order_relaxed) == generation) {
+        // Publish coarse result so the user sees something fast.
+        std::lock_guard<std::mutex> lock(renderMutex);
+        stagingPixels = localPixels;
+        completedGeneration = generation;
+        renderReady = true;
+    } else {
+        return;
+    }
+
+    // Pass 2: full quality.
+    runPass(camera, localPixels, 1, generation);
+
+    if (renderGeneration.load(std::memory_order_relaxed) != generation) return;
+
+    {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        stagingPixels.swap(localPixels);
+        completedGeneration = generation;
+        renderReady = true;
+    }
+}
+#endif
