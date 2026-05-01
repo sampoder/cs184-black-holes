@@ -16,6 +16,10 @@
 #include <thread>
 #include <vector>
 
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl2.h"
+
 // ── Resolution ──────────────────────────────────────────────────────────────
 constexpr int WIDTH  = 800;
 constexpr int HEIGHT = 800;
@@ -95,6 +99,12 @@ struct CameraState {
     // inner object loop only runs when the ray is inside this sphere.
     Vec3  objCenter;
     float objBoundR2;
+    
+    // Disk color multiplier (0.0 - 1.0 range, applied to the disk)
+    float diskColorR;
+    float diskColorG;
+    float diskColorB;
+
 };
 
 constexpr int OBJECT_LIMIT = 64;  // cap so traceRay's per-step loop stays cheap
@@ -168,6 +178,12 @@ static float camYaw       = 0.0f;
 static float camPitch     = 1.2f;
 static bool  needsRedraw  = true;
 
+// Disk color sliders (0.0 to 1.0 range, multiplier)
+// Start with base orange: R=255, G=200, B=150 → normalized to 1.0
+static float diskColorR = 1.0f;
+static float diskColorG = 0.784f;  // 200/255
+static float diskColorB = 0.588f;  // 150/255
+
 // Animation clock that only advances when the user isn't interacting, so the
 // disk/stars freeze during camera moves. Updated from the main thread only.
 static float                 animTime     = 0.0f;
@@ -194,7 +210,7 @@ static void spawnObject() {
     float angle       = rand01() * 6.2831853f;
     float radius      = 10.0f + 14.0f * rand01();           // 10..24
     float yOffset     = -3.0f +  6.0f * rand01();           // -3..3
-    float speedFactor = 0.50f + 0.40f * rand01();           // 0.5..0.9 of v_circ
+    float speedFactor = 0.85f + 0.15f * rand01();           // 0.85..1.0 of v_circ
     float tilt        = (-0.4f + 0.8f * rand01());          // ±0.4 rad out-of-plane vel
     int   colourIdx   = (int)(rand01() * (float)NEON_COUNT);
     if (colourIdx >= NEON_COUNT) colourIdx = NEON_COUNT - 1;
@@ -322,7 +338,7 @@ static inline void objectColour(const Vec3& normal, NeonRGB c,
     b = (uint8_t)((float)c.b * t);
 }
 
-static inline void diskColour(float radius, float angle, float time, uint8_t& r, uint8_t& g, uint8_t& b) {
+static inline void diskColour(float radius, float angle, float time, float colorR, float colorG, float colorB, uint8_t& r, uint8_t& g, uint8_t& b) {
     float t = 1.0f - (radius - DISK_INNER) / (DISK_OUTER - DISK_INNER);
     if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
     // Differential (Keplerian) rotation: a point at lab-angle `angle` is, at
@@ -337,19 +353,19 @@ static inline void diskColour(float radius, float angle, float time, uint8_t& r,
     t *= swirl * clump;
     if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
     if (t > 0.7f) {
-        r = 255;
-        g = (uint8_t)(200 + 55 * ((t - 0.7f) / 0.3f));
-        b = (uint8_t)(150 + 105 * ((t - 0.7f) / 0.3f));
+        r = (uint8_t)(255.0f * colorR);
+        g = (uint8_t)((200 + 55 * ((t - 0.7f) / 0.3f)) * colorG);
+        b = (uint8_t)((150 + 105 * ((t - 0.7f) / 0.3f)) * colorB);
     } else if (t > 0.3f) {
         float s = (t - 0.3f) / 0.4f;
-        r = (uint8_t)(100 + 155 * s);
-        g = (uint8_t)(30 + 170 * s);
-        b = (uint8_t)(5 + 145 * s);
+        r = (uint8_t)((100 + 155 * s) * colorR);
+        g = (uint8_t)((30 + 170 * s) * colorG);
+        b = (uint8_t)((5 + 145 * s) * colorB);
     } else {
         float s = t / 0.3f;
-        r = (uint8_t)(100 * s);
-        g = (uint8_t)(20 * s);
-        b = (uint8_t)(5 * s);
+        r = (uint8_t)(100 * s * colorR);
+        g = (uint8_t)(20 * s * colorG);
+        b = (uint8_t)(5 * s * colorB);
     }
     float doppler = 0.6f + 0.4f * std::sin(angle + 1.0f);
     float fr = (float)r * doppler; if (fr > 255.0f) fr = 255.0f;
@@ -370,6 +386,7 @@ static inline void diskColour(float radius, float angle, float time, uint8_t& r,
 static inline void traceRay(Vec3 pos, Vec3 dir, float time,
                             const ObjectSnapshot* objs, int objCount,
                             const Vec3& objCenter, float objBoundR2,
+                            float diskColorR, float diskColorG, float diskColorB,
                             uint8_t& r, uint8_t& g, uint8_t& b) {
     Vec3 hVec = pos.cross(dir);
     float h2 = hVec.dot(hVec);
@@ -412,7 +429,7 @@ static inline void traceRay(Vec3 pos, Vec3 dir, float time,
             diskR2 > DISK_INNER2 && diskR2 < DISK_OUTER2) {
             float diskR = std::sqrt(diskR2);
             float angle = std::atan2(pos.z, pos.x);
-            diskColour(diskR, angle, time, r, g, b);
+            diskColour(diskR, angle, time, diskColorR, diskColorG, diskColorB, r, g, b);
             return;
         }
 
@@ -500,6 +517,7 @@ static void renderTile(const CameraState& camera,
             traceRay(camPos, rayDir, camera.time,
                      camera.objects.data(), (int)camera.objects.size(),
                      camera.objCenter, camera.objBoundR2,
+                     camera.diskColorR, camera.diskColorG, camera.diskColorB,
                      r, g, b);
 
             // Replicate to the stride×stride block (coarse pass).
@@ -519,6 +537,9 @@ static void requestRender() {
         pendingCamera.yaw   = camYaw;
         pendingCamera.pitch = camPitch;
         pendingCamera.time  = animTime;
+        pendingCamera.diskColorR = diskColorR;
+        pendingCamera.diskColorG = diskColorG;
+        pendingCamera.diskColorB = diskColorB;
         pendingCamera.objects.resize(objects.size());
         for (size_t i = 0; i < objects.size(); ++i)
             pendingCamera.objects[i] = {objects[i].pos, objects[i].color};
@@ -679,7 +700,13 @@ static void renderCoordinator() {
 // ═══════════════════════════════════════════════════════════════════════════
 //  GLFW callbacks
 // ═══════════════════════════════════════════════════════════════════════════
-static void key_callback(GLFWwindow* win, int key, int /*sc*/, int action, int /*mods*/) {
+static void key_callback(GLFWwindow* win, int key, int sc, int action, int mods) {
+    ImGui_ImplGlfw_KeyCallback(win, key, sc, action, mods);
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureKeyboard && key != GLFW_KEY_ESCAPE)
+        return;
+
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
     if (key == GLFW_KEY_ESCAPE) {
@@ -714,7 +741,13 @@ static void key_callback(GLFWwindow* win, int key, int /*sc*/, int action, int /
     }
 }
 
-static void mouse_button_callback(GLFWwindow* win, int button, int action, int /*mods*/) {
+static void mouse_button_callback(GLFWwindow* win, int button, int action, int mods) {
+    ImGui_ImplGlfw_MouseButtonCallback(win, button, action, mods);
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse)
+        return;
+
     if (button != GLFW_MOUSE_BUTTON_LEFT) return;
     if (action == GLFW_PRESS) {
         mouseDown = true;
@@ -724,7 +757,13 @@ static void mouse_button_callback(GLFWwindow* win, int button, int action, int /
     }
 }
 
-static void cursor_position_callback(GLFWwindow* /*win*/, double mx, double my) {
+static void cursor_position_callback(GLFWwindow* win, double mx, double my) {
+    ImGui_ImplGlfw_CursorPosCallback(win, mx, my);
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse)
+        return;
+
     if (!mouseDown) return;
 
     double dx = mx - lastMouseX;
@@ -740,7 +779,13 @@ static void cursor_position_callback(GLFWwindow* /*win*/, double mx, double my) 
     requestRender();
 }
 
-static void scroll_callback(GLFWwindow* /*win*/, double /*xoff*/, double yoff) {
+static void scroll_callback(GLFWwindow* win, double xoff, double yoff) {
+    ImGui_ImplGlfw_ScrollCallback(win, xoff, yoff);
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse)
+        return;
+
     camDist -= (float)(yoff * 2.0);
     clampCamera();
     noteInteraction();
@@ -760,6 +805,34 @@ static void drawFrame(GLFWwindow* win) {
     glRasterPos2f(-1.0f, 1.0f);
     glDrawPixels(WIDTH, HEIGHT, GL_RGB, GL_UNSIGNED_BYTE, displayPixels.data());
 
+    // Render ImGui UI
+    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 150), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Color Controls", nullptr, ImGuiWindowFlags_NoMove);
+    
+    ImGui::Text("Disk Color Adjustment");
+    if (ImGui::SliderFloat("Red##diskRed", &diskColorR, 0.0f, 1.0f)) {
+        requestRender();
+    }
+    if (ImGui::SliderFloat("Green##diskGreen", &diskColorG, 0.0f, 1.0f)) {
+        requestRender();
+    }
+    if (ImGui::SliderFloat("Blue##diskBlue", &diskColorB, 0.0f, 1.0f)) {
+        requestRender();
+    }
+    if (ImGui::Button("Reset to Orange")) {
+        diskColorR = 1.0f;
+        diskColorG = 0.784f;
+        diskColorB = 0.588f;
+        requestRender();
+    }
+    
+    ImGui::End();
+
+    // ImGui rendering
+    ImGui::Render();
+    ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
+
     glfwSwapBuffers(win);
 }
 
@@ -778,6 +851,16 @@ int main() {
 
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
+
+    // Setup ImGui context
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::StyleColorsDark();
+
+    // Setup Platform/Renderer backends
+    ImGui_ImplGlfw_InitForOpenGL(win, false);  // false: we handle callbacks manually
+    ImGui_ImplOpenGL2_Init();
 
     // Persistent worker pool.
     const unsigned threadCount = std::max(1u, std::thread::hardware_concurrency());
@@ -801,6 +884,11 @@ int main() {
 
     while (!glfwWindowShouldClose(win)) {
         glfwWaitEventsTimeout(0.005);
+
+        // Start ImGui frame
+        ImGui_ImplOpenGL2_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
 
         // Advance the animation clock only while idle — freezes disk/stars
         // during camera moves so all the work goes into spatial responsiveness.
@@ -842,10 +930,8 @@ int main() {
             }
         }
 
-        if (needsRedraw) {
-            needsRedraw = false;
-            drawFrame(win);
-        }
+        needsRedraw = false;
+        drawFrame(win);
     }
 
     {
@@ -860,6 +946,11 @@ int main() {
     poolDoneCv.notify_all();
     coordinator.join();
     for (auto& w : workers) w.join();
+
+    // Cleanup ImGui
+    ImGui_ImplOpenGL2_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
 
     glfwDestroyWindow(win);
     glfwTerminate();

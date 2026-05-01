@@ -1,3 +1,3 @@
-/Users/sam/Documents/GitHub/cs184-black-holes/build/CMakeFiles/blackhole.dir
-/Users/sam/Documents/GitHub/cs184-black-holes/build/CMakeFiles/edit_cache.dir
-/Users/sam/Documents/GitHub/cs184-black-holes/build/CMakeFiles/rebuild_cache.dir
+/Users/hhf/Desktop/cs184/cs184-black-holes/build/CMakeFiles/blackhole.dir
+/Users/hhf/Desktop/cs184/cs184-black-holes/build/CMakeFiles/edit_cache.dir
+/Users/hhf/Desktop/cs184/cs184-black-holes/build/CMakeFiles/rebuild_cache.dir
