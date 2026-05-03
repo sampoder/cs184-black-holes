@@ -163,6 +163,14 @@ constexpr float STEP_FAR_COEFF = 0.08f;     // far-field: stepSize ≈ 0.08 * r
 constexpr float STEP_MAX  = 8.0f;           // cap so we don't skip past the disk
 constexpr float NEAR_RADIUS = 4.0f * RS;
 constexpr float NEAR_RADIUS2 = NEAR_RADIUS * NEAR_RADIUS;
+constexpr float PHOTON_SPHERE = 1.5f * RS;
+constexpr float PHOTON_SPHERE2 = PHOTON_SPHERE * PHOTON_SPHERE;
+constexpr float STEP_STRONG = 0.0125f;      // tighter integration in strongest-field region
+constexpr float STEP_PHOTON_MIN = 0.006f;   // very small step for near-trapped rays
+constexpr float STRONG_RADIUS = 2.4f * RS;
+constexpr float STRONG_RADIUS2 = STRONG_RADIUS * STRONG_RADIUS;
+constexpr float PHOTON_BAND_INNER = 1.25f * RS;
+constexpr float PHOTON_BAND_OUTER = 2.2f * RS;
 
 // Squared thresholds (avoid sqrt in hot loop)
 constexpr float RS2       = RS * RS;
@@ -230,6 +238,20 @@ static void stepObjects(float dtReal) {
     float dt = dtReal * OBJECT_TIME_SCALE;
     constexpr int substeps = 6;
     float h = dt / (float)substeps;
+
+    auto objectAccel = [](const Vec3& pos, const Vec3& vel) {
+        float r2 = pos.dot(pos);
+        float invR2 = 1.0f / r2;
+        float invR  = std::sqrt(invR2);
+        float invR3 = invR2 * invR;
+        float invR5 = invR3 * invR2;
+        Vec3  hVec  = pos.cross(vel);
+        float h2    = hVec.dot(hVec);
+        // a = -pos/r^3 - 3 h^2 pos / r^5  (GR correction in the second term)
+        float accelMag = -invR3 - 3.0f * h2 * invR5;
+        return pos * accelMag;
+    };
+
     for (int i = 0; i < substeps; ++i) {
         for (size_t k = 0; k < objects.size();) {
             Object& o = objects[k];
@@ -239,18 +261,27 @@ static void stepObjects(float dtReal) {
                 objects.erase(objects.begin() + k);
                 continue;
             }
-            float invR2 = 1.0f / r2;
-            float invR  = std::sqrt(invR2);
-            float invR3 = invR2 * invR;
-            float invR5 = invR3 * invR2;
-            Vec3  hVec  = o.pos.cross(o.vel);
-            float h2    = hVec.dot(hVec);
-            // a = -pos/r^3 - 3 h^2 pos / r^5  (GR correction in the second term)
-            float accelMag = -invR3 - 3.0f * h2 * invR5;
-            Vec3 accel = o.pos * accelMag;
-            // Symplectic Euler (kick-drift): cheap and conserves energy reasonably.
-            o.vel = o.vel + accel * h;
-            o.pos = o.pos + o.vel * h;
+
+            const Vec3 k1Pos = o.vel;
+            const Vec3 k1Vel = objectAccel(o.pos, o.vel);
+
+            const Vec3 p2 = o.pos + k1Pos * (0.5f * h);
+            const Vec3 v2 = o.vel + k1Vel * (0.5f * h);
+            const Vec3 k2Pos = v2;
+            const Vec3 k2Vel = objectAccel(p2, v2);
+
+            const Vec3 p3 = o.pos + k2Pos * (0.5f * h);
+            const Vec3 v3 = o.vel + k2Vel * (0.5f * h);
+            const Vec3 k3Pos = v3;
+            const Vec3 k3Vel = objectAccel(p3, v3);
+
+            const Vec3 p4 = o.pos + k3Pos * h;
+            const Vec3 v4 = o.vel + k3Vel * h;
+            const Vec3 k4Pos = v4;
+            const Vec3 k4Vel = objectAccel(p4, v4);
+
+            o.pos = o.pos + (k1Pos + (k2Pos + k3Pos) * 2.0f + k4Pos) * (h / 6.0f);
+            o.vel = o.vel + (k1Vel + (k2Vel + k3Vel) * 2.0f + k4Vel) * (h / 6.0f);
             ++k;
         }
     }
@@ -323,6 +354,9 @@ static inline void starColour(const Vec3& dir, float time, uint8_t& r, uint8_t& 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Accretion disk colour
 // ═══════════════════════════════════════════════════════════════════════════
+constexpr float DISK_TEMP_INNER = 15000.0f;
+constexpr float DISK_TEMP_FLOOR = 900.0f;
+
 // Glowing test particle. Cheap fake-shading + emissive floor; the per-object
 // neon RGB picks the hue while shading just modulates brightness.
 static inline void objectColour(const Vec3& normal, NeonRGB c,
@@ -338,40 +372,235 @@ static inline void objectColour(const Vec3& normal, NeonRGB c,
     b = (uint8_t)((float)c.b * t);
 }
 
-static inline void diskColour(float radius, float angle, float time, float colorR, float colorG, float colorB, uint8_t& r, uint8_t& g, uint8_t& b) {
-    float t = 1.0f - (radius - DISK_INNER) / (DISK_OUTER - DISK_INNER);
-    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
-    // Differential (Keplerian) rotation: a point at lab-angle `angle` is, at
-    // time t, the material that started at angle (angle - ω(r) t).
-    // ω(r) = DISK_OMEGA_K / r^1.5.  r * sqrt(r) = r^1.5 — one sqrt, no pow().
+static inline float clamp01(float x) {
+    if (x < 0.0f) return 0.0f;
+    if (x > 1.0f) return 1.0f;
+    return x;
+}
+
+static inline float smoothstep(float edge0, float edge1, float x) {
+    float t = clamp01((x - edge0) / (edge1 - edge0));
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static inline Vec3 lerpVec3(const Vec3& a, const Vec3& b, float t) {
+    return a + (b - a) * t;
+}
+
+static inline float blackbodyChannel(float kelvin, float scale, float offset) {
+    float x = kelvin / scale + offset;
+    return clamp01(x);
+}
+
+static inline Vec3 blackbodyRGB(float kelvin) {
+    // Compact approximation biased for hot accretion disks: blue-white at the
+    // inner edge, orange-red as temperature falls outward.
+    float t = kelvin / 1000.0f;
+    float r = (t <= 6.5f) ? 1.0f : blackbodyChannel(kelvin, 9000.0f, 0.12f);
+    float g;
+    float b;
+
+    if (t <= 6.6f) {
+        g = blackbodyChannel(kelvin, 4200.0f, -0.10f);
+    } else {
+        g = blackbodyChannel(kelvin, 8200.0f, 0.02f);
+    }
+
+    if (t <= 1.9f) {
+        b = 0.0f;
+    } else {
+        b = blackbodyChannel(kelvin, 5200.0f, -0.16f);
+    }
+
+    return {r, g, b};
+}
+
+static inline void diskColour(float radius,
+                              float angle,
+                              float time,
+                              const Vec3& rayDir,
+                              float colorR,
+                              float colorG,
+                              float colorB,
+                              uint8_t& r,
+                              uint8_t& g,
+                              uint8_t& b) {
+    float x = (radius - DISK_INNER) / (DISK_OUTER - DISK_INNER);
+    float radialBlend = 1.0f - clamp01(x);
+
+    // Thin-disk emissivity: roughly F(r) ∝ r^-3 (1 - sqrt(r_in / r)).
+    float rimCutoff = 1.0f - std::sqrt(DISK_INNER / radius);
+    if (rimCutoff < 0.0f) rimCutoff = 0.0f;
+    float emissivity = rimCutoff / (radius * radius * radius);
+    emissivity *= 2600.0f;
+
+    // Differential rotation remains, but now only perturbs density/emissivity.
     float invR15 = 1.0f / (radius * std::sqrt(radius));
     float phase = time * DISK_OMEGA_K * invR15;
     float localAngle = angle - phase;
-    float swirl = std::sin(localAngle * 6.0f + radius * 2.0f) * 0.15f + 0.85f;
-    // A second slower lump pattern so the disk has bright clumps that drift.
-    float clump = 0.85f + 0.25f * std::sin(localAngle * 2.0f - radius * 0.5f);
-    t *= swirl * clump;
-    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
-    if (t > 0.7f) {
-        r = (uint8_t)(255.0f * colorR);
-        g = (uint8_t)((200 + 55 * ((t - 0.7f) / 0.3f)) * colorG);
-        b = (uint8_t)((150 + 105 * ((t - 0.7f) / 0.3f)) * colorB);
-    } else if (t > 0.3f) {
-        float s = (t - 0.3f) / 0.4f;
-        r = (uint8_t)((100 + 155 * s) * colorR);
-        g = (uint8_t)((30 + 170 * s) * colorG);
-        b = (uint8_t)((5 + 145 * s) * colorB);
+    float densityWave = 0.92f + 0.08f * std::sin(localAngle * 6.0f + radius * 1.8f);
+    float clump = 0.96f + 0.04f * std::sin(localAngle * 2.0f - radius * 0.45f);
+    emissivity *= densityWave * clump;
+
+    // Temperature profile: T ∝ [r^-3 (1 - sqrt(r_in/r))]^(1/4).
+    float temperature = DISK_TEMP_INNER * std::pow(std::max(1e-5f, emissivity), 0.25f);
+    if (temperature < DISK_TEMP_FLOOR) temperature = DISK_TEMP_FLOOR;
+
+    // Circular orbital motion in the disk plane, using the local rotating phase.
+    Vec3 tangent = {-std::sin(localAngle), 0.0f, std::cos(localAngle)};
+    Vec3 toCamera = (rayDir * -1.0f).normalised();
+    float beta = std::sqrt(BH_MASS / radius);
+    if (beta > 0.55f) beta = 0.55f;
+    float gamma = 1.0f / std::sqrt(std::max(1e-4f, 1.0f - beta * beta));
+    float mu = tangent.dot(toCamera);
+    float doppler = 1.0f / (gamma * (1.0f - beta * mu));
+
+    // Schwarzschild redshift for a static observer at radius r.
+    float gravShift = std::sqrt(std::max(0.02f, 1.0f - RS / radius));
+    float shiftFactor = doppler * gravShift;
+
+    float observedTemp = temperature * shiftFactor;
+    Vec3 rgb = blackbodyRGB(observedTemp);
+
+    // Surface brightness roughly scales like g^4 for thin-disk emission.
+    float intensity = emissivity * shiftFactor * shiftFactor * shiftFactor * shiftFactor;
+    intensity *= 2.4f + 1.4f * radialBlend;
+    if (intensity > 1.0f) intensity = 1.0f;
+
+    // Keep the UI sliders as a gentle user tint, not the primary shading model.
+    rgb.x *= 0.65f + 0.35f * colorR;
+    rgb.y *= 0.65f + 0.35f * colorG;
+    rgb.z *= 0.65f + 0.35f * colorB;
+
+    float fr = 255.0f * rgb.x * intensity;
+    float fg = 255.0f * rgb.y * intensity;
+    float fb = 255.0f * rgb.z * intensity;
+    if (fr > 255.0f) fr = 255.0f;
+    if (fg > 255.0f) fg = 255.0f;
+    if (fb > 255.0f) fb = 255.0f;
+    r = (uint8_t)fr;
+    g = (uint8_t)fg;
+    b = (uint8_t)fb;
+}
+
+static inline Vec3 geodesicAccel(const Vec3& pos, float h2) {
+    float dist2 = pos.dot(pos);
+    float invDist2 = 1.0f / dist2;
+    float invDist = std::sqrt(invDist2);
+    float invDist5 = invDist2 * invDist2 * invDist;
+    float accelMag = -1.5f * RS * h2 * invDist5;
+    return pos * accelMag;
+}
+
+static inline void integrateRayRK4(Vec3& pos, Vec3& dir, float h2, float stepSize) {
+    const Vec3 k1Pos = dir;
+    const Vec3 k1Dir = geodesicAccel(pos, h2);
+
+    const Vec3 k2PosState = pos + k1Pos * (0.5f * stepSize);
+    const Vec3 k2DirState = dir + k1Dir * (0.5f * stepSize);
+    const Vec3 k2Pos = k2DirState;
+    const Vec3 k2Dir = geodesicAccel(k2PosState, h2);
+
+    const Vec3 k3PosState = pos + k2Pos * (0.5f * stepSize);
+    const Vec3 k3DirState = dir + k2Dir * (0.5f * stepSize);
+    const Vec3 k3Pos = k3DirState;
+    const Vec3 k3Dir = geodesicAccel(k3PosState, h2);
+
+    const Vec3 k4PosState = pos + k3Pos * stepSize;
+    const Vec3 k4DirState = dir + k3Dir * stepSize;
+    const Vec3 k4Pos = k4DirState;
+    const Vec3 k4Dir = geodesicAccel(k4PosState, h2);
+
+    pos = pos + (k1Pos + (k2Pos + k3Pos) * 2.0f + k4Pos) * (stepSize / 6.0f);
+    dir = dir + (k1Dir + (k2Dir + k3Dir) * 2.0f + k4Dir) * (stepSize / 6.0f);
+
+    // Keep the ray direction numerically well-conditioned after many steps.
+    dir = dir.normalised();
+}
+
+static inline bool intersectDiskSegment(const Vec3& startPos,
+                                        const Vec3& startDir,
+                                        const Vec3& endPos,
+                                        const Vec3& endDir,
+                                        float& hitT,
+                                        Vec3& hitPos,
+                                        Vec3& hitDir) {
+    const float dy = endPos.y - startPos.y;
+
+    auto evaluateCandidate = [&](float t, float& bestT) {
+        if (t < 0.0f || t > 1.0f || t >= bestT) return;
+        Vec3 samplePos = lerpVec3(startPos, endPos, t);
+        if (std::fabs(samplePos.y) > DISK_HALF_THICKNESS) return;
+        float diskR2 = samplePos.x * samplePos.x + samplePos.z * samplePos.z;
+        if (diskR2 <= DISK_INNER2 || diskR2 >= DISK_OUTER2) return;
+        bestT = t;
+        hitPos = samplePos;
+        hitDir = lerpVec3(startDir, endDir, t).normalised();
+    };
+
+    float bestT = 2.0f;
+    evaluateCandidate(0.0f, bestT);
+
+    if (std::fabs(dy) < 1e-6f) {
+        evaluateCandidate(0.5f, bestT);
+        evaluateCandidate(1.0f, bestT);
     } else {
-        float s = t / 0.3f;
-        r = (uint8_t)(100 * s * colorR);
-        g = (uint8_t)(20 * s * colorG);
-        b = (uint8_t)(5 * s * colorB);
+        evaluateCandidate((-DISK_HALF_THICKNESS - startPos.y) / dy, bestT);
+        evaluateCandidate(( DISK_HALF_THICKNESS - startPos.y) / dy, bestT);
+        evaluateCandidate((-startPos.y) / dy, bestT);
+        evaluateCandidate(1.0f, bestT);
     }
-    float doppler = 0.6f + 0.4f * std::sin(angle + 1.0f);
-    float fr = (float)r * doppler; if (fr > 255.0f) fr = 255.0f;
-    float fg = (float)g * doppler; if (fg > 255.0f) fg = 255.0f;
-    float fb = (float)b * doppler; if (fb > 255.0f) fb = 255.0f;
-    r = (uint8_t)fr; g = (uint8_t)fg; b = (uint8_t)fb;
+
+    hitT = bestT;
+    return bestT <= 1.0f;
+}
+
+static inline bool intersectObjectSegment(const Vec3& startPos,
+                                          const Vec3& startDir,
+                                          const Vec3& endPos,
+                                          const Vec3& endDir,
+                                          const ObjectSnapshot* objs,
+                                          int objCount,
+                                          float& hitT,
+                                          Vec3& hitPos,
+                                          Vec3& hitDir,
+                                          NeonRGB& hitColor,
+                                          Vec3& hitNormal) {
+    const Vec3 seg = endPos - startPos;
+    const float a = seg.dot(seg);
+    if (a <= 1e-8f) return false;
+
+    bool found = false;
+    float bestT = 2.0f;
+
+    for (int k = 0; k < objCount; ++k) {
+        const Vec3 rel = startPos - objs[k].pos;
+        const float b = 2.0f * rel.dot(seg);
+        const float c = rel.dot(rel) - OBJECT_RADIUS2;
+        const float disc = b * b - 4.0f * a * c;
+        if (disc < 0.0f) continue;
+
+        const float sqrtDisc = std::sqrt(disc);
+        const float inv2A = 0.5f / a;
+        const float t0 = (-b - sqrtDisc) * inv2A;
+        const float t1 = (-b + sqrtDisc) * inv2A;
+
+        auto takeRoot = [&](float t) {
+            if (t < 0.0f || t > 1.0f || t >= bestT) return;
+            bestT = t;
+            hitPos = lerpVec3(startPos, endPos, t);
+            hitDir = lerpVec3(startDir, endDir, t).normalised();
+            hitNormal = (hitPos - objs[k].pos).normalised();
+            hitColor = objs[k].color;
+            found = true;
+        };
+
+        takeRoot(t0);
+        takeRoot(t1);
+    }
+
+    hitT = bestT;
+    return found;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -429,22 +658,39 @@ static inline void traceRay(Vec3 pos, Vec3 dir, float time,
             diskR2 > DISK_INNER2 && diskR2 < DISK_OUTER2) {
             float diskR = std::sqrt(diskR2);
             float angle = std::atan2(pos.z, pos.x);
-            diskColour(diskR, angle, time, diskColorR, diskColorG, diskColorB, r, g, b);
+            diskColour(diskR, angle, time, dir, diskColorR, diskColorG, diskColorB, r, g, b);
             return;
         }
 
         float invDist2 = 1.0f / dist2;
         float invDist  = std::sqrt(invDist2);
 
-        // Adaptive step size: STEP_NEAR close to the BH; in flat space let
-        // it grow ∝ r so distant marching is logarithmic in r.
+        // Adaptive step size: shrink aggressively around the photon sphere,
+        // especially for nearly tangential rays that can linger there.
         float stepSize;
-        if (dist2 < NEAR_RADIUS2) {
+        if (dist2 < PHOTON_SPHERE2) {
+            stepSize = STEP_STRONG;
+        } else if (dist2 < STRONG_RADIUS2) {
+            stepSize = STEP_NEAR * 0.5f;
+        } else if (dist2 < NEAR_RADIUS2) {
             stepSize = STEP_NEAR;
         } else {
             float dist = dist2 * invDist;
             stepSize = STEP_FAR_COEFF * dist;
             if (stepSize > STEP_MAX) stepSize = STEP_MAX;
+        }
+
+        float dist = dist2 * invDist;
+        if (dist > PHOTON_BAND_INNER && dist < PHOTON_BAND_OUTER) {
+            float radialness = std::fabs(pos.dot(dir)) * invDist;
+            float tangentialness = 1.0f - clamp01(radialness);
+
+            float innerFalloff = smoothstep(PHOTON_BAND_INNER, PHOTON_SPHERE, dist);
+            float outerFalloff = 1.0f - smoothstep(PHOTON_SPHERE, PHOTON_BAND_OUTER, dist);
+            float bandWeight = innerFalloff < outerFalloff ? innerFalloff : outerFalloff;
+
+            float photonStep = STEP_STRONG - (STEP_STRONG - STEP_PHOTON_MIN) * bandWeight * tangentialness;
+            if (photonStep < stepSize) stepSize = photonStep;
         }
 
         // Disk-skip guard: when the ray is anywhere inside the disk's radial
@@ -467,12 +713,41 @@ static inline void traceRay(Vec3 pos, Vec3 dir, float time,
             if (maxStep < stepSize) stepSize = maxStep;
         }
 
-        // Geodesic deflection: a = -1.5 RS h^2 / r^5 * pos
-        float invDist5 = invDist2 * invDist2 * invDist;
-        float accelMag = -1.5f * RS * h2 * invDist5;
-        Vec3 accel = pos * accelMag;
-        dir = dir + accel * stepSize;
-        pos = pos + dir * stepSize;
+        Vec3 nextPos = pos;
+        Vec3 nextDir = dir;
+        integrateRayRK4(nextPos, nextDir, h2, stepSize);
+
+        float diskHitT = 2.0f;
+        float objectHitT = 2.0f;
+        Vec3 diskHitPos, diskHitDir;
+        Vec3 objectHitPos, objectHitDir, objectHitNormal;
+        NeonRGB objectHitColor{};
+
+        bool hitDisk = intersectDiskSegment(pos, dir, nextPos, nextDir,
+                                            diskHitT, diskHitPos, diskHitDir);
+        bool hitObject = false;
+        if (objCount > 0 && nearestToObj2 < OBJ_INFLUENCE2) {
+            hitObject = intersectObjectSegment(pos, dir, nextPos, nextDir,
+                                               objs, objCount,
+                                               objectHitT, objectHitPos, objectHitDir,
+                                               objectHitColor, objectHitNormal);
+        }
+
+        if (hitObject && (!hitDisk || objectHitT <= diskHitT)) {
+            objectColour(objectHitNormal, objectHitColor, r, g, b);
+            return;
+        }
+
+        if (hitDisk) {
+            float hitR = std::sqrt(diskHitPos.x * diskHitPos.x + diskHitPos.z * diskHitPos.z);
+            float hitAngle = std::atan2(diskHitPos.z, diskHitPos.x);
+            diskColour(hitR, hitAngle, time, diskHitDir,
+                       diskColorR, diskColorG, diskColorB, r, g, b);
+            return;
+        }
+
+        pos = nextPos;
+        dir = nextDir;
     }
 
     starColour(dir.normalised(), time, r, g, b);
