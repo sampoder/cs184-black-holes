@@ -807,8 +807,8 @@ static void drawFrame(GLFWwindow* win) {
 
     // Render ImGui UI
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(300, 150), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Color Controls", nullptr, ImGuiWindowFlags_NoMove);
+    ImGui::SetNextWindowSize(ImVec2(330, 275), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Render Controls", nullptr, ImGuiWindowFlags_NoMove);
     
     ImGui::Text("Disk Color Adjustment");
     if (ImGui::SliderFloat("Red##diskRed", &diskColorR, 0.0f, 1.0f)) {
@@ -826,6 +826,24 @@ static void drawFrame(GLFWwindow* win) {
         diskColorB = 0.588f;
         requestRender();
     }
+
+    constexpr float RAD_TO_DEG = 57.2957795f;
+    constexpr float MIN_CAM_DIST = RS * 2.5f;
+    constexpr float MAX_CAM_DIST = 100.0f;
+    float sp = std::sin(camPitch), cp = std::cos(camPitch);
+    float sy = std::sin(camYaw),   cy = std::cos(camYaw);
+    Vec3 camPos = {camDist * sp * sy, camDist * cp, camDist * sp * cy};
+    float zoomPct = 100.0f * (MAX_CAM_DIST - camDist) / (MAX_CAM_DIST - MIN_CAM_DIST);
+    if (zoomPct < 0.0f) zoomPct = 0.0f; else if (zoomPct > 100.0f) zoomPct = 100.0f;
+
+    ImGui::Separator();
+    ImGui::Text("Camera Stats");
+    ImGui::Text("Zoom: %.1f%%", zoomPct);
+    ImGui::Text("Distance: %.2f RS (%.2f world)", camDist / RS, camDist);
+    ImGui::Text("Position: (%.2f, %.2f, %.2f)", camPos.x, camPos.y, camPos.z);
+    ImGui::Text("Yaw / Pitch: %.1f deg / %.1f deg",
+                camYaw * RAD_TO_DEG, camPitch * RAD_TO_DEG);
+    ImGui::Text("FOV: %.1f deg", FOV * RAD_TO_DEG);
     
     ImGui::End();
 
