@@ -467,10 +467,11 @@ static inline void diskColour(float radius,
     intensity *= 2.4f + 1.4f * radialBlend;
     if (intensity > 1.0f) intensity = 1.0f;
 
-    // Keep the UI sliders as a gentle user tint, not the primary shading model.
-    rgb.x *= 0.65f + 0.35f * colorR;
-    rgb.y *= 0.65f + 0.35f * colorG;
-    rgb.z *= 0.65f + 0.35f * colorB;
+    // Let the UI sliders strongly tint the physical disk color without fully
+    // erasing channels at zero, so the disk remains readable.
+    rgb.x *= 0.15f + 0.85f * colorR;
+    rgb.y *= 0.15f + 0.85f * colorG;
+    rgb.z *= 0.15f + 0.85f * colorB;
 
     float fr = 255.0f * rgb.x * intensity;
     float fg = 255.0f * rgb.y * intensity;
